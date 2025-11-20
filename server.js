@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy
+// server.js - OpenAI to NVIDIA NIM API Proxy (МАКСИМАЛЬНАЯ версия для Render)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -6,9 +6,23 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Оптимизация для Render Free Tier
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
+
+// Очистка памяти каждые 10 минут (реже = меньше нагрузка)
+if (process.env.NODE_ENV === 'production') {
+  setInterval(() => {
+    if (global.gc) {
+      global.gc();
+      console.log('[Render] Garbage collection запущен');
+    }
+  }, 600000); // 10 минут вместо 5
+}
+
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' })); // МАКСИМУМ для Render
 
 // NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
@@ -35,9 +49,15 @@ const MODEL_MAPPING = {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    service: 'OpenAI to NVIDIA NIM Proxy', 
+    service: 'OpenAI to NVIDIA NIM Proxy (Render MAX)', 
     reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE
+    thinking_mode: ENABLE_THINKING_MODE,
+    memory: process.memoryUsage(),
+    limits: {
+      payload: '50MB',
+      history_trim: '200KB / 50 messages',
+      max_tokens: '16384'
+    }
   });
 });
 
@@ -61,6 +81,20 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
+    // ============ УМНАЯ ОБРЕЗКА (только при реальной необходимости) ============
+    let trimmedMessages = messages;
+    const totalChars = JSON.stringify(messages).length;
+    
+    // Обрезаем только если ОЧЕНЬ большая история (200KB+)
+    if (totalChars > 200000) {
+      const systemMessages = messages.filter(m => m.role === 'system');
+      const recentMessages = messages.filter(m => m.role !== 'system').slice(-50); // Последние 50 сообщений
+      trimmedMessages = [...systemMessages, ...recentMessages];
+      
+      console.log(`[Render] Обрезка: ${messages.length} → ${trimmedMessages.length} сообщений (${totalChars} → ${JSON.stringify(trimmedMessages).length} символов)`);
+    }
+    // ===========================================================================
+    
     // Smart model selection with fallback
     let nimModel = MODEL_MAPPING[model];
     if (!nimModel) {
@@ -68,7 +102,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         await axios.post(`${NIM_API_BASE}/chat/completions`, {
           model: model,
           messages: [{ role: 'user', content: 'test' }],
-          max_tokens: 128000
+          max_tokens: 1
         }, {
           headers: { 'Authorization': `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
           validateStatus: (status) => status < 500
@@ -91,30 +125,33 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     }
     
-    // Transform OpenAI request to NIM format
     // Подсчитываем примерное количество токенов в сообщениях
-const inputText = JSON.stringify(messages);
-const estimatedInputTokens = Math.ceil(inputText.length / 3.5); // Точнее, чем /4
+    const inputText = JSON.stringify(trimmedMessages);
+    const estimatedInputTokens = Math.ceil(inputText.length / 3.5);
 
-// Безопасный max_tokens с учётом контекста модели
-const modelContextLimit = 131072; // 128K контекст DeepSeek-R1
-const safetyBuffer = 1000; // Буфер на всякий случай
-const maxSafeOutputTokens = modelContextLimit - estimatedInputTokens - safetyBuffer;
+    // Безопасный max_tokens с учётом контекста модели
+    const modelContextLimit = 131072; // 128K контекст DeepSeek-R1
+    const safetyBuffer = 1000;
+    const maxSafeOutputTokens = modelContextLimit - estimatedInputTokens - safetyBuffer;
 
-// Используем либо запрошенное значение, либо безопасное (что меньше)
-const finalMaxTokens = max_tokens 
-  ? Math.min(max_tokens, maxSafeOutputTokens) 
-  : Math.min(8192, maxSafeOutputTokens); // По умолчанию 8K, если не указано
+    // МАКСИМАЛЬНЫЕ токены для Render (16K - баланс между скоростью и длиной)
+    const renderMaxTokens = 16384;
+    const finalMaxTokens = max_tokens 
+      ? Math.min(max_tokens, maxSafeOutputTokens, renderMaxTokens) 
+      : Math.min(renderMaxTokens, maxSafeOutputTokens);
 
-// Transform OpenAI request to NIM format
-const nimRequest = {
-  model: nimModel,
-  messages: messages,
-  temperature: temperature || 0.8,
-  max_tokens: Math.max(512, finalMaxTokens), // Минимум 512 токенов
-  extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
-  stream: stream || false
-};
+    console.log(`[Tokens] Input: ~${estimatedInputTokens}, Output: ${finalMaxTokens}, Total: ~${estimatedInputTokens + finalMaxTokens}`);
+
+    // Transform OpenAI request to NIM format
+    const nimRequest = {
+      model: nimModel,
+      messages: trimmedMessages,
+      temperature: temperature || 0.8,
+      max_tokens: Math.max(512, finalMaxTokens),
+      extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
+      stream: stream || false
+    };
+    
     // Make request to NVIDIA NIM API
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
       headers: {
@@ -253,7 +290,10 @@ app.all('*', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
+  console.log(`МАКСИМАЛЬНАЯ конфигурация для Render Free Tier`);
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`Max tokens limit: 16384 (aggressive)`);
+  console.log(`History trim: 200KB / 50 messages`);
 });
