@@ -92,15 +92,29 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
     // Transform OpenAI request to NIM format
-    const nimRequest = {
-      model: nimModel,
-      messages: messages,
-      temperature: temperature || 0.8,
-      max_tokens: max_tokens || 128000,
-      extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
-      stream: stream || false
-    };
-    
+    // Подсчитываем примерное количество токенов в сообщениях
+const inputText = JSON.stringify(messages);
+const estimatedInputTokens = Math.ceil(inputText.length / 3.5); // Точнее, чем /4
+
+// Безопасный max_tokens с учётом контекста модели
+const modelContextLimit = 131072; // 128K контекст DeepSeek-R1
+const safetyBuffer = 1000; // Буфер на всякий случай
+const maxSafeOutputTokens = modelContextLimit - estimatedInputTokens - safetyBuffer;
+
+// Используем либо запрошенное значение, либо безопасное (что меньше)
+const finalMaxTokens = max_tokens 
+  ? Math.min(max_tokens, maxSafeOutputTokens) 
+  : Math.min(8192, maxSafeOutputTokens); // По умолчанию 8K, если не указано
+
+// Transform OpenAI request to NIM format
+const nimRequest = {
+  model: nimModel,
+  messages: messages,
+  temperature: temperature || 0.8,
+  max_tokens: Math.max(512, finalMaxTokens), // Минимум 512 токенов
+  extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
+  stream: stream || false
+};
     // Make request to NVIDIA NIM API
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
       headers: {
