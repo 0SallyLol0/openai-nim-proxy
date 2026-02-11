@@ -146,7 +146,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     const nimRequest = {
       model: nimModel,
       messages: trimmedMessages,
-      temperature: temperature || 0.8,
+      temperature: temperature || 1,
       max_tokens: Math.max(512, finalMaxTokens),
       extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
       stream: stream || false
